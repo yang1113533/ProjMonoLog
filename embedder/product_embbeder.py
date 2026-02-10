@@ -4,6 +4,11 @@ import hashlib
 from datetime import datetime, timezone
 from PIL import Image
 from sentence_transformers import SentenceTransformer
+
+# Work around oneDNN/PIR issues on some Windows CPU installs.
+os.environ.setdefault("FLAGS_use_onednn", "false")
+
+from paddleocr import PaddleOCR
 import chromadb
 
 # ==========================================
@@ -13,6 +18,7 @@ JSON_FILE = "../crawl/20260210_144639_products.json"  # 최신 데이터 파일 
 IMAGE_DIR = "../crawl/images"
 DB_PATH = "./chroma_db"
 COLLECTION_NAME = "rakuten_products"
+DEBUG_OCR = True
 
 def run_embedding():
     print("🚀 스마트 임베딩 시스템 가동 (중복 방지 & 이미지 검증 포함)...")
@@ -24,6 +30,9 @@ def run_embedding():
     # 2. 모델 로드
     print("📥 CLIP 모델 로딩 중...")
     model = SentenceTransformer('clip-ViT-B-32')
+
+    print("📥 PaddleOCR 로딩 중...")
+    ocr = PaddleOCR(use_textline_orientation=True, lang='japan')
 
     # 3. JSON 데이터 로드
     try:
@@ -80,6 +89,7 @@ def run_embedding():
                 image_index[product_id] = f_name
 
     # 5. 데이터 순회
+    debug_printed = 0
     for idx, item in enumerate(products):
         product_id = str(item['id'])
         
@@ -96,15 +106,10 @@ def run_embedding():
         image_hash = _hash_file(image_path)
 
         try:
-            # [체크 3] 이미지가 깨지지 않고 열리는가? (Validation)
-            with Image.open(image_path) as img:
-                # 이미지를 모델이 이해할 수 있게 벡터로 변환
-                vector = model.encode(img).tolist()
-            
             now_iso = datetime.now(timezone.utc).isoformat()
             existing_meta = existing_meta_by_id.get(product_id)
             created_at = (existing_meta or {}).get("created_at") or now_iso
-            metadata = {
+            metadata_base = {
                 "name": item['name'],
                 "price": item['price'],
                 "maker": item['maker'],
@@ -128,7 +133,7 @@ def run_embedding():
                         "image_hash",
                     ]
                     for key in compare_keys:
-                        if existing_meta.get(key) != metadata.get(key):
+                        if existing_meta.get(key) != metadata_base.get(key):
                             changed = True
                             break
                 else:
@@ -138,12 +143,40 @@ def run_embedding():
                     skip_count += 1
                     continue
 
+                # [체크 3] 이미지가 깨지지 않고 열리는가? (Validation)
+                with Image.open(image_path) as img:
+                    # 이미지를 모델이 이해할 수 있게 벡터로 변환
+                    vector = model.encode(img).tolist()
+
+                ocr_lines = _run_ocr(ocr, image_path)
+                if DEBUG_OCR:
+                    print(f"   🧪 OCR 디버그: {product_id} lines={len(ocr_lines)}")
+                    for line in ocr_lines[:3]:
+                        print(f"      - {line}")
+                    debug_printed += 1
+                metadata = dict(metadata_base)
+                metadata["ocr_lines"] = _serialize_ocr_lines(ocr_lines)
+
                 batch_ids.append(product_id)
                 batch_embeddings.append(vector)
                 batch_metadatas.append(metadata)
                 update_count += 1
                 print(f"   🔁 [갱신] {item['name'][:15]}... 업데이트됨")
             else:
+                # [체크 3] 이미지가 깨지지 않고 열리는가? (Validation)
+                with Image.open(image_path) as img:
+                    # 이미지를 모델이 이해할 수 있게 벡터로 변환
+                    vector = model.encode(img).tolist()
+
+                ocr_lines = _run_ocr(ocr, image_path)
+                if DEBUG_OCR:
+                    print(f"   🧪 OCR 디버그: {product_id} lines={len(ocr_lines)}")
+                    for line in ocr_lines[:3]:
+                        print(f"      - {line}")
+                    debug_printed += 1
+                metadata = dict(metadata_base)
+                metadata["ocr_lines"] = _serialize_ocr_lines(ocr_lines)
+
                 batch_ids.append(product_id)
                 batch_embeddings.append(vector)
                 batch_metadatas.append(metadata)
@@ -176,6 +209,75 @@ def run_embedding():
     print(f"   - 새로 추가됨: {new_count}")
     print(f"   - 갱신됨: {update_count}")
     print("="*30)
+
+def _run_ocr(ocr: PaddleOCR, image_path: str) -> list:
+    lines = []
+
+    try:
+        result = ocr.predict(input=image_path)
+        for res in result:
+            lines.extend(_extract_ocr_lines(res))
+    except Exception:
+        return []
+
+    return lines
+
+
+def _extract_ocr_lines(result) -> list:
+    if isinstance(result, dict):
+        texts = result.get("rec_texts") or result.get("texts")
+        scores = result.get("rec_scores") or result.get("scores")
+        if texts:
+            lines = []
+            for text, score in zip(texts, scores or [None] * len(texts)):
+                clean_text = str(text).strip()
+                clean_score = float(score) if score is not None else None
+                if not clean_text:
+                    continue
+                if clean_score is not None and clean_score <= 0.0:
+                    continue
+                lines.append({"text": clean_text, "score": clean_score})
+            return lines
+        if "text" in result:
+            return [{"text": result.get("text"), "score": result.get("score")}]
+        return []
+
+    for attr in ("to_json", "json"):
+        if hasattr(result, attr):
+            try:
+                data = getattr(result, attr)()
+                return _extract_ocr_lines(data)
+            except Exception:
+                pass
+
+    if isinstance(result, list):
+        if len(result) == 1 and isinstance(result[0], list):
+            result = result[0]
+        lines = []
+        for line in result:
+            if isinstance(line, (list, tuple)) and len(line) >= 2:
+                payload = line[1]
+                if isinstance(payload, (list, tuple)) and len(payload) >= 2:
+                    text = str(payload[0]).strip()
+                    score = float(payload[1]) if payload[1] is not None else None
+                    if not text:
+                        continue
+                    if score is not None and score <= 0.0:
+                        continue
+                    lines.append({"text": text, "score": score})
+        return lines
+
+    return []
+
+
+def _serialize_ocr_lines(lines: list) -> str:
+    if not lines:
+        return ""
+    try:
+        return json.dumps(lines, ensure_ascii=False)
+    except Exception:
+        return ""
+
 
 def _hash_file(file_path: str) -> str:
     hasher = hashlib.sha256()

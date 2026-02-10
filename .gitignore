@@ -24,3 +24,4 @@ crawl/*.json
 
 # embedder 임베딩 데이터
 embedder/chroma_db/
+embedder/metadata_view.csv

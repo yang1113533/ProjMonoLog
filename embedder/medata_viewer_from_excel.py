@@ -1,6 +1,7 @@
 import sqlite3
 import pandas as pd
 import os
+import json
 
 # ==========================================
 # 1. 설정 (내 환경에 맞게 수정)
@@ -26,10 +27,44 @@ SELECT
     MAX(CASE WHEN key = 'image_hash' THEN string_value END) AS 이미지해시,
     MAX(CASE WHEN key = 'created_at' THEN string_value END) AS 생성일,
     MAX(CASE WHEN key = 'updated_at' THEN string_value END) AS 수정일,
-    MAX(CASE WHEN key = 'ocr_text' THEN string_value END) AS OCR내용
+    MAX(CASE WHEN key = 'ocr_lines' THEN string_value END) AS OCR내용
 FROM embedding_metadata
 GROUP BY id;
 """
+
+
+def _normalize_ocr_value(value):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return str(value)
+
+    text = value.strip()
+    if not text:
+        return ""
+
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            return value
+
+        if isinstance(parsed, list):
+            parts = []
+            for item in parsed:
+                if isinstance(item, dict):
+                    line_text = item.get("text")
+                    if line_text:
+                        parts.append(str(line_text))
+                elif isinstance(item, str):
+                    parts.append(item)
+            return " | ".join(parts)
+
+        if isinstance(parsed, dict):
+            line_text = parsed.get("text")
+            return str(line_text) if line_text else ""
+
+    return value
 
 def run_export():
     print(f"📂 DB 읽는 중... ({DB_PATH})")
@@ -50,6 +85,9 @@ def run_export():
         if df.empty:
             print("⚠️ 저장된 데이터가 없습니다.")
             return
+
+        if "OCR내용" in df.columns:
+            df["OCR내용"] = df["OCR내용"].apply(_normalize_ocr_value)
 
         # 4. CSV 파일로 저장 (엑셀에서 한글 안 깨지게 utf-8-sig 사용)
         df.to_csv(OUTPUT_FILE, index=False, encoding='utf-8-sig')
