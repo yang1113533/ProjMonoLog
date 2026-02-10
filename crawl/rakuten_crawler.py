@@ -14,7 +14,7 @@ DEFAULT_URL = "https://sm.rakuten.co.jp/search/200029"
 
 # [수정 3] 수집할 페이지 구간 설정 (예: 2페이지부터 5페이지까지)
 START_PAGE = 1
-MAX_PAGES = 99
+MAX_PAGES = 1
 
 IMAGE_DIR = "images"
 NAV_TIMEOUT_MS = 30000
