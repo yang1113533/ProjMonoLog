@@ -14,6 +14,7 @@ import uvicorn
 import traceback
 from pathlib import Path
 from scipy.spatial.distance import cosine
+from difflib import SequenceMatcher
 
 # ==========================================
 # 1. 설정 및 모델 로드
@@ -23,6 +24,11 @@ COLLECTION_NAME = "rakuten_products"
 RESPONSE_JSON_PATH = os.path.join(os.path.dirname(__file__), "response.json")
 DEBUG_SCORING = True
 DEBUG_SCORING_LIMIT = 5
+
+def similarity(a: str, b: str) -> float:
+    """두 문자열의 유사도 계산 (0.0~1.0)"""
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+
 def _load_env_file() -> None:
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.exists():
@@ -64,7 +70,6 @@ def load_weights() -> dict:
         "base_score_weight": _get_float("MONOLOG_BASE_SCORE_WEIGHT", 0.3),
         "brand_bonus": _get_float("MONOLOG_BRAND_BONUS", 0.15),
         "name_bonus": _get_float("MONOLOG_NAME_BONUS", 0.15),
-        "keyword_bonus": _get_float("MONOLOG_KEYWORD_BONUS", 0.15),
         "ocr_threshold_minimum": _get_int("MONOLOG_OCR_THRESHOLD_MINIMUM", 10),
         "ocr_threshold_fair": _get_int("MONOLOG_OCR_THRESHOLD_FAIR", 30),
         "ocr_threshold_good": _get_int("MONOLOG_OCR_THRESHOLD_GOOD", 60),
@@ -75,13 +80,13 @@ def load_weights() -> dict:
         "price_bonus_20pct": _get_float("MONOLOG_PRICE_BONUS_20PCT", 0.05),
         "price_threshold_10pct": _get_int("MONOLOG_PRICE_THRESHOLD_10PCT", 10),
         "price_threshold_20pct": _get_int("MONOLOG_PRICE_THRESHOLD_20PCT", 20),
+        "similarity_threshold": _get_float("MONOLOG_SIMILARITY_THRESHOLD", 0.8),
     }
     
     # 최대 가능한 보너스 합계 계산 (모든 조건 만족)
     weights["max_bonus"] = (
         weights["brand_bonus"] +  # 브랜드 일치
         weights["name_bonus"] +  # 제품명 일치
-        weights["keyword_bonus"] +  # 키워드 일치
         weights["ocr_bonus_good"] +  # OCR 우수
         weights["price_bonus_10pct"]  # 가격 10% 이내
     )
@@ -90,20 +95,37 @@ def load_weights() -> dict:
 
 
 WEIGHTS = load_weights()
+SIMILARITY_THRESHOLD = WEIGHTS.get("similarity_threshold", 0.8)
 
 app = FastAPI(title="Mono-Log AI Server", description="이미지 중심 하이브리드 검색 엔진")
 
-print("⏳ 시스템 초기화 중...")
-# (2) CLIP 모델 로드
-model = SentenceTransformer('clip-ViT-B-32')
+# 모델은 첫 요청 시 로드 (lazy loading)
+model = None
+ocr = None
+client = None
+collection = None
 
-# (3) OCR 엔진 로드 (서버 켤 때 한 번만!)
-ocr = PaddleOCR(use_textline_orientation=True, lang='japan')
-
-# (4) DB 연결
-client = chromadb.PersistentClient(path=DB_PATH)
-collection = client.get_collection(name=COLLECTION_NAME)
-print("✅ 서버 준비 완료!")
+def initialize_models():
+    """모델 초기화 (첫 요청 시 한 번만 실행)"""
+    global model, ocr, client, collection
+    if model is None:
+        print("⏳ 시스템 초기화 중...")
+        import time
+        
+        start = time.time()
+        model = SentenceTransformer('clip-ViT-B-32')
+        print(f"  ✓ CLIP 모델 로드: {time.time()-start:.2f}초")
+        
+        start = time.time()
+        ocr = PaddleOCR(use_textline_orientation=True, lang='japan')
+        print(f"  ✓ OCR 엔진 로드: {time.time()-start:.2f}초")
+        
+        start = time.time()
+        client = chromadb.PersistentClient(path=DB_PATH)
+        collection = client.get_collection(name=COLLECTION_NAME)
+        print(f"  ✓ DB 연결: {time.time()-start:.2f}초")
+        
+        print("✅ 서버 준비 완료!")
 
 # ==========================================
 # 2. 핵심 로직: 가중치 계산 함수
@@ -116,6 +138,7 @@ def calculate_final_score(item, user_inputs, detected_texts=None):
     bonus_score = 0.0
     
     # [필터 1] 브랜드 (가장 강력한 힌트)
+    brand_matched = False
     user_brand = user_inputs.get('brand')
     if user_brand:
         # 입력값을 소문자로 바꾸고, 매핑된 일본어가 있으면 가져옴
@@ -125,40 +148,68 @@ def calculate_final_score(item, user_inputs, detected_texts=None):
         # 예: 'nissin' -> '日清' 반환 -> DB의 '日清食品'에 포함되므로 OK!
         if target_maker_keyword in item.get('maker', ''):
             bonus_score += WEIGHTS["brand_bonus"]
+            brand_matched = True
+    
+    # [필터 1-2] OCR에서 브랜드명 발견 (user_brand 없어도 작동)
+    if not brand_matched and detected_texts:
+        detected_full = ' '.join(detected_texts)
+        item_maker = item.get('maker', '')
+        # 완전 일치 체크
+        if item_maker and item_maker in detected_full:
+            bonus_score += WEIGHTS["brand_bonus"]
+            brand_matched = True
+        # 유사도 체크 (OCR 오류 대응: HISSIN vs NISSIN)
+        elif item_maker:
+            for word in detected_texts:
+                if len(word) >= 3 and similarity(word, item_maker) >= SIMILARITY_THRESHOLD:
+                    bonus_score += WEIGHTS["brand_bonus"]
+                    brand_matched = True
+                    break
 
-    # [필터 2] 가격 (비슷하면 점수)
+    # [필터 2] 제품명 (name 파라미터 또는 OCR 자동 감지)
+    name_matched = False
+    user_name = user_inputs.get('name')
+    if user_name:
+        # API name 입력: DB name에 포함되는지 확인
+        if user_name.lower() in item.get('name', '').lower():
+            bonus_score += WEIGHTS["name_bonus"]
+            name_matched = True
+    
+    # OCR에서 제품명 자동 감지
+    if not name_matched and detected_texts:
+        detected_full = ' '.join(detected_texts)
+        item_name = item.get('name', '')
+        # 완전 일치 체크
+        if item_name and (item_name in detected_full or 
+                          any(word in item_name for word in detected_texts if len(word) >= 2)):
+            bonus_score += WEIGHTS["name_bonus"]
+            name_matched = True
+        # 유사도 체크 (OCR 오류 대응)
+        elif item_name:
+            for word in detected_texts:
+                if len(word) >= 3 and similarity(word, item_name) >= SIMILARITY_THRESHOLD:
+                    bonus_score += WEIGHTS["name_bonus"]
+                    name_matched = True
+                    break
+
+    # [필터 3] 가격 (비슷하면 점수)
     user_price = user_inputs.get('price')
     if user_price:
         try:
             target_price = int(user_price)
             item_price = int(item.get('price', 0))
-            # 가격 차이가 작을수록 점수 높음 (최대 0.1점)
             diff = abs(target_price - item_price)
-            price_ratio = (diff / target_price * 100) if target_price > 0 else 100  # 퍼센트 계산
+            price_ratio = (diff / target_price * 100) if target_price > 0 else 100
             if price_ratio <= WEIGHTS["price_threshold_10pct"]:
                 bonus_score += WEIGHTS["price_bonus_10pct"]
             elif price_ratio <= WEIGHTS["price_threshold_20pct"]:
                 bonus_score += WEIGHTS["price_bonus_20pct"]
         except:
-            pass  # 가격 입력이 숫자가 아니면 무시
+            pass
 
-    # [필터 3] 제품명 (name 파라미터)
-    user_name = user_inputs.get('name')
-    if user_name:
-        full_text = (item.get('name', '') + item.get('ocr_text', '')).lower()
-        if user_name.lower() in full_text:
-            bonus_score += WEIGHTS["name_bonus"]
-    
-    # [필터 4] 키워드 (keyword 파라미터)
-    user_keyword = user_inputs.get('keyword')
-    if user_keyword:
-        full_text = (item.get('name', '') + item.get('ocr_text', '')).lower()
-        if user_keyword.lower() in full_text:
-            bonus_score += WEIGHTS["keyword_bonus"]
-
-    # [필터 5] OCR 일치율 (업로드 이미지와 DB 메타데이터 비교)
+    # [필터 4] OCR 일치율 (업로드 이미지 OCR과 DB ocr_lines 비교)
     if detected_texts:
-        _, ocr_bonus = _calculate_ocr_match_score(detected_texts, item)
+        _, ocr_bonus = _calculate_ocr_match_score(detected_texts, item, debug_ocr=False)
         bonus_score += ocr_bonus
 
     # 정규화: 0~1 범위로 변환
@@ -172,19 +223,19 @@ def calculate_final_score(item, user_inputs, detected_texts=None):
     return min(normalized_score, 1.0)  # 1.0을 넘지 않도록
 
 
-def calculate_score_with_debug(item, user_inputs, detected_texts=None):
+def calculate_score_with_debug(item, user_inputs, detected_texts=None, debug_ocr=False):
     base_score = item['similarity_score']
     bonus_score = 0.0
     reasons = []
     breakdown = {
         "brand": 0.0,
-        "price": 0.0,
         "name": 0.0,
-        "keyword": 0.0,
+        "price": 0.0,
         "ocr": 0.0,
         "ocr_ratio": 0.0
     }
 
+    brand_matched = False
     user_brand = user_inputs.get('brand')
     if user_brand:
         target_maker_keyword = get_official_maker_name(user_brand)
@@ -192,14 +243,80 @@ def calculate_score_with_debug(item, user_inputs, detected_texts=None):
             bonus_score += WEIGHTS["brand_bonus"]
             breakdown["brand"] = WEIGHTS["brand_bonus"]
             reasons.append(f"brand:+{WEIGHTS['brand_bonus']:.2f}({target_maker_keyword})")
+            brand_matched = True
+    
+    # OCR에서 브랜드명 발견
+    if not brand_matched and detected_texts:
+        detected_full = ' '.join(detected_texts)
+        item_maker = item.get('maker', '')
+        matched_word = None
+        match_type = None
+        # 완전 일치
+        if item_maker and item_maker in detected_full:
+            bonus_score += WEIGHTS["brand_bonus"]
+            breakdown["brand"] = WEIGHTS["brand_bonus"]
+            matched_word = item_maker
+            match_type = "exact"
+            brand_matched = True
+        # 유사도 체크
+        elif item_maker:
+            for word in detected_texts:
+                if len(word) >= 3:
+                    sim = similarity(word, item_maker)
+                    if sim >= SIMILARITY_THRESHOLD:
+                        bonus_score += WEIGHTS["brand_bonus"]
+                        breakdown["brand"] = WEIGHTS["brand_bonus"]
+                        matched_word = f"{word}≈{item_maker}"
+                        match_type = f"{sim:.0%}"
+                        brand_matched = True
+                        break
+        if matched_word:
+            reasons.append(f"brand:+{WEIGHTS['brand_bonus']:.2f}(OCR:{matched_word})")
 
+    # 제품명 (name 파라미터 또는 OCR 자동 감지)
+    name_matched = False
+    user_name = user_inputs.get('name')
+    if user_name:
+        if user_name.lower() in item.get('name', '').lower():
+            bonus_score += WEIGHTS["name_bonus"]
+            breakdown["name"] = WEIGHTS["name_bonus"]
+            reasons.append(f"name:+{WEIGHTS['name_bonus']:.2f}(API:{user_name})")
+            name_matched = True
+    
+    # OCR에서 제품명 자동 감지
+    if not name_matched and detected_texts:
+        detected_full = ' '.join(detected_texts)
+        item_name = item.get('name', '')
+        matched_word = None
+        # 완전 일치
+        if item_name and (item_name in detected_full or 
+                          any(word in item_name for word in detected_texts if len(word) >= 2)):
+            bonus_score += WEIGHTS["name_bonus"]
+            breakdown["name"] = WEIGHTS["name_bonus"]
+            matched_word = next((w for w in detected_texts if len(w) >= 2 and w in item_name), item_name[:10])
+            name_matched = True
+        # 유사도 체크
+        elif item_name:
+            for word in detected_texts:
+                if len(word) >= 3:
+                    sim = similarity(word, item_name)
+                    if sim >= SIMILARITY_THRESHOLD:
+                        bonus_score += WEIGHTS["name_bonus"]
+                        breakdown["name"] = WEIGHTS["name_bonus"]
+                        matched_word = f"{word}≈{item_name[:10]}"
+                        name_matched = True
+                        break
+        if matched_word:
+            reasons.append(f"name:+{WEIGHTS['name_bonus']:.2f}(OCR:{matched_word})")
+
+    # 가격
     user_price = user_inputs.get('price')
     if user_price:
         try:
             target_price = int(user_price)
             item_price = int(item.get('price', 0))
             diff = abs(target_price - item_price)
-            price_ratio = (diff / target_price * 100) if target_price > 0 else 100  # 퍼센트 계산
+            price_ratio = (diff / target_price * 100) if target_price > 0 else 100
             if price_ratio <= WEIGHTS["price_threshold_10pct"]:
                 bonus_score += WEIGHTS["price_bonus_10pct"]
                 breakdown["price"] = WEIGHTS["price_bonus_10pct"]
@@ -211,27 +328,13 @@ def calculate_score_with_debug(item, user_inputs, detected_texts=None):
         except Exception:
             pass
 
-    # 제품명 (name 파라미터)
-    user_name = user_inputs.get('name')
-    if user_name:
-        full_text = (item.get('name', '') + item.get('ocr_text', '')).lower()
-        if user_name.lower() in full_text:
-            bonus_score += WEIGHTS["name_bonus"]
-            breakdown["name"] = WEIGHTS["name_bonus"]
-            reasons.append(f"name:+{WEIGHTS['name_bonus']:.2f}({user_name})")
-    
-    # 키워드 (keyword 파라미터)
-    user_keyword = user_inputs.get('keyword')
-    if user_keyword:
-        full_text = (item.get('name', '') + item.get('ocr_text', '')).lower()
-        if user_keyword.lower() in full_text:
-            bonus_score += WEIGHTS["keyword_bonus"]
-            breakdown["keyword"] = WEIGHTS["keyword_bonus"]
-            reasons.append(f"keyword:+{WEIGHTS['keyword_bonus']:.2f}({user_keyword})")
-
     # OCR 일치율 (업로드 이미지 vs DB 메타데이터)
     if detected_texts:
-        match_ratio, ocr_bonus = _calculate_ocr_match_score(detected_texts, item)
+        match_ratio, ocr_bonus = _calculate_ocr_match_score(
+            detected_texts,
+            item,
+            debug_ocr=debug_ocr,
+        )
         breakdown["ocr_ratio"] = match_ratio
         if ocr_bonus > 0:  # 최소치 이상일 때만
             bonus_score += ocr_bonus
@@ -289,7 +392,7 @@ def _extract_texts(res):
     return []
 
 
-def _calculate_ocr_match_score(detected_texts, item):
+def _calculate_ocr_match_score(detected_texts, item, debug_ocr=False):
     """
     업로드 이미지의 OCR 텍스트와 DB 상품 정보(name, maker, ocr_lines)의 일치율 계산
     반환: (일치율%, 보너스 점수)
@@ -313,14 +416,45 @@ def _calculate_ocr_match_score(detected_texts, item):
     except:
         pass
     
-    # 겹치는 단어 계산 (대소문자 무시)
+    # 겹치는 단어 계산 (완전 일치 + 유사도)
     detected_set = set(w.lower() for w in detected_texts if w)
     db_set = set(w.lower() for w in db_texts if w)
+    
+    # 완전 일치
+    exact_overlap = detected_set & db_set
+    overlap_count = len(exact_overlap)
+    
+    # 유사도 매칭 (완전 일치 못한 것들끼리)
+    remaining_detected = detected_set - exact_overlap
+    remaining_db = db_set - exact_overlap
+    fuzzy_matches = []
+    
+    for det_word in remaining_detected:
+        if len(det_word) < 3:  # 너무 짧은 단어는 skip
+            continue
+        for db_word in remaining_db:
+            if len(db_word) < 3:
+                continue
+            sim = similarity(det_word, db_word)
+            if sim >= SIMILARITY_THRESHOLD:
+                fuzzy_matches.append((det_word, db_word, sim))
+                overlap_count += 1
+                remaining_db.discard(db_word)  # 중복 매칭 방지
+                break
+    
+    # 🔍 DEBUG: OCR 매칭 과정 출력
+    if debug_ocr:
+        print(f"    🔍 OCR DEBUG for {item.get('name', 'Unknown')[:30]}")
+        print(f"       Detected: {list(detected_set)[:5]}... (total: {len(detected_set)})")
+        print(f"       DB: {list(db_set)[:5]}... (total: {len(db_set)})")
+        print(f"       Exact match: {exact_overlap}")
+        if fuzzy_matches:
+            print(f"       Fuzzy match: {[(d, b, f'{s:.0%}') for d, b, s in fuzzy_matches[:3]]}")
     
     if not detected_set or not db_set:
         return 0.0, 0.0
     
-    overlap = len(detected_set & db_set)
+    overlap = overlap_count
     total = max(len(detected_set), len(db_set))
     
     match_ratio = (overlap / total * 100) if total > 0 else 0.0
@@ -344,9 +478,11 @@ async def search_by_image(
     file: UploadFile = File(...),      # 필수: 이미지 파일
     name: Optional[str] = Form(None),  # 선택: 제품명
     price: Optional[str] = Form(None), # 선택: 가격
-    brand: Optional[str] = Form(None), # 선택: 브랜드
-    keyword: Optional[str] = Form(None)# 선택: 기타 키워드
+    brand: Optional[str] = Form(None)  # 선택: 브랜드
 ):
+    # 모델 초기화 (첫 요청 시 한 번만)
+    initialize_models()
+    
     try:
         # 1. 이미지 읽기
         image_data = await file.read()
@@ -371,18 +507,19 @@ async def search_by_image(
             include=["metadatas", "distances", "embeddings"]
         )
 
-        print(
-            "DEBUG query results:",
-            {
-                "ids": len(results.get("ids", [])),
-                "metadatas": len(results.get("metadatas", [])),
-                "distances": len(results.get("distances", [])),
-            },
-        )
+        if DEBUG_SCORING:
+            print(
+                "DEBUG query results:",
+                {
+                    "ids": len(results.get("ids", [])),
+                    "metadatas": len(results.get("metadatas", [])),
+                    "distances": len(results.get("distances", [])),
+                },
+            )
 
         # 5. 2차 재순위화 (Re-ranking)
         candidates = []
-        user_inputs = {"name": name, "price": price, "brand": brand, "keyword": keyword}
+        user_inputs = {"name": name, "price": price, "brand": brand}
         
         ids_list = results.get('ids', [])
         metas_list = results.get('metadatas', [])
@@ -401,15 +538,16 @@ async def search_by_image(
         distances = dists_list[0] if dists_list else []
         embeddings = embeddings_list[0] if embeddings_list else []
 
-        print(
-            "DEBUG first batch sizes:",
-            {
-                "ids": len(ids),
-                "metadatas": len(metadatas),
-                "distances": len(distances),
-                "embeddings": len(embeddings),
-            },
-        )
+        if DEBUG_SCORING:
+            print(
+                "DEBUG first batch sizes:",
+                {
+                    "ids": len(ids),
+                    "metadatas": len(metadatas),
+                    "distances": len(distances),
+                    "embeddings": len(embeddings),
+                },
+            )
 
         debug_scored = 0
         for item_id, meta, dist, embedding in zip(ids, metadatas, distances, embeddings):
@@ -421,7 +559,12 @@ async def search_by_image(
             
             # 여기서 가중치 계산! (detected_texts 포함)
             if DEBUG_SCORING:
-                final_score, reasons, breakdown = calculate_score_with_debug(item, user_inputs, detected_texts)
+                final_score, reasons, breakdown = calculate_score_with_debug(
+                    item,
+                    user_inputs,
+                    detected_texts,
+                    debug_ocr=debug_scored < DEBUG_SCORING_LIMIT,
+                )
             else:
                 final_score = calculate_final_score(item, user_inputs, detected_texts)
                 reasons = []
@@ -437,11 +580,10 @@ async def search_by_image(
                 print(f"📊 Base Score (벡터 유사도): {item['similarity_score']:.4f}")
                 print(f"🎁 Bonus Breakdown:")
                 print(f"   • Brand:   +{breakdown.get('brand', 0.0):.3f}")
-                print(f"   • Price:   +{breakdown.get('price', 0.0):.3f}")
                 print(f"   • Name:    +{breakdown.get('name', 0.0):.3f}")
-                print(f"   • Keyword: +{breakdown.get('keyword', 0.0):.3f}")
+                print(f"   • Price:   +{breakdown.get('price', 0.0):.3f}")
                 print(f"   • OCR:     +{breakdown.get('ocr', 0.0):.3f} (일치율: {breakdown.get('ocr_ratio', 0.0):.1f}%)")
-                print(f"   💡 Total Bonus: {sum([breakdown.get('brand', 0), breakdown.get('price', 0), breakdown.get('name', 0), breakdown.get('keyword', 0), breakdown.get('ocr', 0)]):.3f}")
+                print(f"   💡 Total Bonus: {sum([breakdown.get('brand', 0), breakdown.get('name', 0), breakdown.get('price', 0), breakdown.get('ocr', 0)]):.3f}")
                 print("-" * 80)
                 print(f"⭐ Final Score (정규화): {final_score:.4f}")
                 if reasons:
@@ -475,4 +617,12 @@ async def search_by_image(
 
 
 if __name__ == "__main__":
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    import sys
+    # reload 모드에서는 메인 프로세스에서 불필요한 모델 로드 방지
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False,
+        reload_excludes=["*.pyc", "__pycache__"]
+    )
