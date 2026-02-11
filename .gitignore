@@ -25,3 +25,8 @@ crawl/*.json
 # embedder 임베딩 데이터
 embedder/chroma_db/
 embedder/metadata_view.csv
+
+# search_server 임시 파일
+search_server/__pycache__/
+search_server/*.log
+search_server/response.json

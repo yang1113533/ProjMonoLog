@@ -4,16 +4,92 @@ from pydantic import BaseModel
 from typing import Optional
 from PIL import Image
 import io
+import json
+import os
 import chromadb
 from sentence_transformers import SentenceTransformer
 from paddleocr import PaddleOCR
 import numpy as np
+import uvicorn
+import traceback
+from pathlib import Path
+from scipy.spatial.distance import cosine
 
 # ==========================================
 # 1. 설정 및 모델 로드
 # ==========================================
 DB_PATH = "../embedder/chroma_db"
 COLLECTION_NAME = "rakuten_products"
+RESPONSE_JSON_PATH = os.path.join(os.path.dirname(__file__), "response.json")
+DEBUG_SCORING = True
+DEBUG_SCORING_LIMIT = 5
+def _load_env_file() -> None:
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        os.environ.setdefault(key, value)
+
+
+def _get_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
+def _get_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def load_weights() -> dict:
+    _load_env_file()
+    weights = {
+        "base_score_weight": _get_float("MONOLOG_BASE_SCORE_WEIGHT", 0.3),
+        "brand_bonus": _get_float("MONOLOG_BRAND_BONUS", 0.15),
+        "name_bonus": _get_float("MONOLOG_NAME_BONUS", 0.15),
+        "keyword_bonus": _get_float("MONOLOG_KEYWORD_BONUS", 0.15),
+        "ocr_threshold_minimum": _get_int("MONOLOG_OCR_THRESHOLD_MINIMUM", 10),
+        "ocr_threshold_fair": _get_int("MONOLOG_OCR_THRESHOLD_FAIR", 30),
+        "ocr_threshold_good": _get_int("MONOLOG_OCR_THRESHOLD_GOOD", 60),
+        "ocr_bonus_poor": _get_float("MONOLOG_OCR_BONUS_POOR", 0.0),
+        "ocr_bonus_fair": _get_float("MONOLOG_OCR_BONUS_FAIR", 0.025),
+        "ocr_bonus_good": _get_float("MONOLOG_OCR_BONUS_GOOD", 0.05),
+        "price_bonus_10pct": _get_float("MONOLOG_PRICE_BONUS_10PCT", 0.10),
+        "price_bonus_20pct": _get_float("MONOLOG_PRICE_BONUS_20PCT", 0.05),
+        "price_threshold_10pct": _get_int("MONOLOG_PRICE_THRESHOLD_10PCT", 10),
+        "price_threshold_20pct": _get_int("MONOLOG_PRICE_THRESHOLD_20PCT", 20),
+    }
+    
+    # 최대 가능한 보너스 합계 계산 (모든 조건 만족)
+    weights["max_bonus"] = (
+        weights["brand_bonus"] +  # 브랜드 일치
+        weights["name_bonus"] +  # 제품명 일치
+        weights["keyword_bonus"] +  # 키워드 일치
+        weights["ocr_bonus_good"] +  # OCR 우수
+        weights["price_bonus_10pct"]  # 가격 10% 이내
+    )
+    
+    return weights
+
+
+WEIGHTS = load_weights()
 
 app = FastAPI(title="Mono-Log AI Server", description="이미지 중심 하이브리드 검색 엔진")
 
@@ -22,7 +98,7 @@ print("⏳ 시스템 초기화 중...")
 model = SentenceTransformer('clip-ViT-B-32')
 
 # (3) OCR 엔진 로드 (서버 켤 때 한 번만!)
-ocr = PaddleOCR(use_angle_cls=True, lang='japan', show_log=False)
+ocr = PaddleOCR(use_textline_orientation=True, lang='japan')
 
 # (4) DB 연결
 client = chromadb.PersistentClient(path=DB_PATH)
@@ -32,7 +108,7 @@ print("✅ 서버 준비 완료!")
 # ==========================================
 # 2. 핵심 로직: 가중치 계산 함수
 # ==========================================
-def calculate_final_score(item, user_inputs):
+def calculate_final_score(item, user_inputs, detected_texts=None):
     # 1. 기본 점수: 이미지 벡터 유사도 (0.0 ~ 1.0)
     base_score = item['similarity_score']
     
@@ -48,7 +124,7 @@ def calculate_final_score(item, user_inputs):
         # DB의 제조사(maker) 정보와 비교 (부분 일치)
         # 예: 'nissin' -> '日清' 반환 -> DB의 '日清食品'에 포함되므로 OK!
         if target_maker_keyword in item.get('maker', ''):
-            bonus_score += 0.15
+            bonus_score += WEIGHTS["brand_bonus"]
 
     # [필터 2] 가격 (비슷하면 점수)
     user_price = user_inputs.get('price')
@@ -58,24 +134,207 @@ def calculate_final_score(item, user_inputs):
             item_price = int(item.get('price', 0))
             # 가격 차이가 작을수록 점수 높음 (최대 0.1점)
             diff = abs(target_price - item_price)
-            if diff <= 50: # 50엔 차이 이내면 만점
-                bonus_score += 0.1
-            elif diff <= 200: # 200엔 차이 이내면 부분 점수
-                bonus_score += 0.05
+            price_ratio = (diff / target_price * 100) if target_price > 0 else 100  # 퍼센트 계산
+            if price_ratio <= WEIGHTS["price_threshold_10pct"]:
+                bonus_score += WEIGHTS["price_bonus_10pct"]
+            elif price_ratio <= WEIGHTS["price_threshold_20pct"]:
+                bonus_score += WEIGHTS["price_bonus_20pct"]
         except:
-            pass # 가격 입력이 숫자가 아니면 무시
+            pass  # 가격 입력이 숫자가 아니면 무시
 
-    # [필터 3] 제품명/키워드 (텍스트 포함 여부)
-    keywords = [user_inputs.get('name'), user_inputs.get('keyword')]
-    for kw in keywords:
-        if kw:
-            # 상품명이나 OCR 텍스트에 키워드가 있으면 가산점
-            full_text = (item.get('name', '') + item.get('ocr_text', '')).lower()
-            if kw.lower() in full_text:
-                bonus_score += 0.05
+    # [필터 3] 제품명 (name 파라미터)
+    user_name = user_inputs.get('name')
+    if user_name:
+        full_text = (item.get('name', '') + item.get('ocr_text', '')).lower()
+        if user_name.lower() in full_text:
+            bonus_score += WEIGHTS["name_bonus"]
+    
+    # [필터 4] 키워드 (keyword 파라미터)
+    user_keyword = user_inputs.get('keyword')
+    if user_keyword:
+        full_text = (item.get('name', '') + item.get('ocr_text', '')).lower()
+        if user_keyword.lower() in full_text:
+            bonus_score += WEIGHTS["keyword_bonus"]
 
-    # 최종 점수 반환 (1.0을 넘을 수도 있음)
-    return base_score + bonus_score
+    # [필터 5] OCR 일치율 (업로드 이미지와 DB 메타데이터 비교)
+    if detected_texts:
+        _, ocr_bonus = _calculate_ocr_match_score(detected_texts, item)
+        bonus_score += ocr_bonus
+
+    # 정규화: 0~1 범위로 변환
+    # 최대 가능 점수 = base(1.0) * BASE_WEIGHT + max_bonus * BONUS_WEIGHT
+    bonus_weight = 1.0 - WEIGHTS["base_score_weight"]
+    max_possible = 1.0 * WEIGHTS["base_score_weight"] + WEIGHTS["max_bonus"] * bonus_weight
+    
+    final_score = base_score * WEIGHTS["base_score_weight"] + bonus_score * bonus_weight
+    normalized_score = final_score / max_possible if max_possible > 0 else 0.0
+    
+    return min(normalized_score, 1.0)  # 1.0을 넘지 않도록
+
+
+def calculate_score_with_debug(item, user_inputs, detected_texts=None):
+    base_score = item['similarity_score']
+    bonus_score = 0.0
+    reasons = []
+    breakdown = {
+        "brand": 0.0,
+        "price": 0.0,
+        "name": 0.0,
+        "keyword": 0.0,
+        "ocr": 0.0,
+        "ocr_ratio": 0.0
+    }
+
+    user_brand = user_inputs.get('brand')
+    if user_brand:
+        target_maker_keyword = get_official_maker_name(user_brand)
+        if target_maker_keyword in item.get('maker', ''):
+            bonus_score += WEIGHTS["brand_bonus"]
+            breakdown["brand"] = WEIGHTS["brand_bonus"]
+            reasons.append(f"brand:+{WEIGHTS['brand_bonus']:.2f}({target_maker_keyword})")
+
+    user_price = user_inputs.get('price')
+    if user_price:
+        try:
+            target_price = int(user_price)
+            item_price = int(item.get('price', 0))
+            diff = abs(target_price - item_price)
+            price_ratio = (diff / target_price * 100) if target_price > 0 else 100  # 퍼센트 계산
+            if price_ratio <= WEIGHTS["price_threshold_10pct"]:
+                bonus_score += WEIGHTS["price_bonus_10pct"]
+                breakdown["price"] = WEIGHTS["price_bonus_10pct"]
+                reasons.append(f"price:+{WEIGHTS['price_bonus_10pct']:.2f}(<={WEIGHTS['price_threshold_10pct']:.0f}%)")
+            elif price_ratio <= WEIGHTS["price_threshold_20pct"]:
+                bonus_score += WEIGHTS["price_bonus_20pct"]
+                breakdown["price"] = WEIGHTS["price_bonus_20pct"]
+                reasons.append(f"price:+{WEIGHTS['price_bonus_20pct']:.2f}(<={WEIGHTS['price_threshold_20pct']:.0f}%)")
+        except Exception:
+            pass
+
+    # 제품명 (name 파라미터)
+    user_name = user_inputs.get('name')
+    if user_name:
+        full_text = (item.get('name', '') + item.get('ocr_text', '')).lower()
+        if user_name.lower() in full_text:
+            bonus_score += WEIGHTS["name_bonus"]
+            breakdown["name"] = WEIGHTS["name_bonus"]
+            reasons.append(f"name:+{WEIGHTS['name_bonus']:.2f}({user_name})")
+    
+    # 키워드 (keyword 파라미터)
+    user_keyword = user_inputs.get('keyword')
+    if user_keyword:
+        full_text = (item.get('name', '') + item.get('ocr_text', '')).lower()
+        if user_keyword.lower() in full_text:
+            bonus_score += WEIGHTS["keyword_bonus"]
+            breakdown["keyword"] = WEIGHTS["keyword_bonus"]
+            reasons.append(f"keyword:+{WEIGHTS['keyword_bonus']:.2f}({user_keyword})")
+
+    # OCR 일치율 (업로드 이미지 vs DB 메타데이터)
+    if detected_texts:
+        match_ratio, ocr_bonus = _calculate_ocr_match_score(detected_texts, item)
+        breakdown["ocr_ratio"] = match_ratio
+        if ocr_bonus > 0:  # 최소치 이상일 때만
+            bonus_score += ocr_bonus
+            breakdown["ocr"] = ocr_bonus
+            if match_ratio >= WEIGHTS["ocr_threshold_good"]:
+                level = "우수"
+            elif match_ratio >= WEIGHTS["ocr_threshold_fair"]:
+                level = "보통"
+            else:
+                level = "미흡"
+            reasons.append(f"ocr:+{ocr_bonus:.2f}({match_ratio:.0f}%-{level})")
+        elif match_ratio > 0:
+            # 최소치 미만: 보너스 없지만 일치율 기록
+            reasons.append(f"ocr:+0.00({match_ratio:.0f}%-미흡,최소치미만)")
+
+    # 정규화: 0~1 범위로 변환
+    bonus_weight = 1.0 - WEIGHTS["base_score_weight"]
+    max_possible = 1.0 * WEIGHTS["base_score_weight"] + WEIGHTS["max_bonus"] * bonus_weight
+    
+    final_score = base_score * WEIGHTS["base_score_weight"] + bonus_score * bonus_weight
+    normalized_score = final_score / max_possible if max_possible > 0 else 0.0
+    normalized_score = min(normalized_score, 1.0)  # 1.0을 넘지 않도록
+    
+    return normalized_score, reasons, breakdown
+
+
+def _extract_texts(res):
+    if isinstance(res, dict):
+        texts = res.get("rec_texts") or res.get("texts")
+        if texts:
+            return list(texts)
+        if "text" in res:
+            return [res.get("text")]
+        return []
+
+    for attr in ("to_json", "json"):
+        if hasattr(res, attr):
+            try:
+                data = getattr(res, attr)()
+                return _extract_texts(data)
+            except Exception:
+                pass
+
+    if isinstance(res, list):
+        texts = []
+        for line in res:
+            if isinstance(line, (list, tuple)) and len(line) >= 2:
+                payload = line[1]
+                if isinstance(payload, (list, tuple)) and len(payload) >= 1:
+                    text = str(payload[0]).strip()
+                    if text:
+                        texts.append(text)
+        return texts
+
+    return []
+
+
+def _calculate_ocr_match_score(detected_texts, item):
+    """
+    업로드 이미지의 OCR 텍스트와 DB 상품 정보(name, maker, ocr_lines)의 일치율 계산
+    반환: (일치율%, 보너스 점수)
+    """
+    # DB에서 텍스트 추출
+    db_texts = []
+    
+    # name과 maker 추가
+    if item.get('name'):
+        db_texts.extend(item['name'].split())
+    if item.get('maker'):
+        db_texts.extend(item['maker'].split())
+    
+    # ocr_lines 파싱 (JSON 문자열)
+    ocr_lines_str = item.get('ocr_lines', '[]')
+    try:
+        ocr_lines = json.loads(ocr_lines_str)
+        for line in ocr_lines:
+            if isinstance(line, dict) and 'text' in line:
+                db_texts.extend(line['text'].split())
+    except:
+        pass
+    
+    # 겹치는 단어 계산 (대소문자 무시)
+    detected_set = set(w.lower() for w in detected_texts if w)
+    db_set = set(w.lower() for w in db_texts if w)
+    
+    if not detected_set or not db_set:
+        return 0.0, 0.0
+    
+    overlap = len(detected_set & db_set)
+    total = max(len(detected_set), len(db_set))
+    
+    match_ratio = (overlap / total * 100) if total > 0 else 0.0
+    
+    # 3단계 구간 (임계값은 .env에서 로드)
+    # 최소치 미만이면 보너스 미지급
+    if match_ratio >= WEIGHTS["ocr_threshold_good"]:
+        return match_ratio, WEIGHTS["ocr_bonus_good"]  # 우수
+    elif match_ratio >= WEIGHTS["ocr_threshold_fair"]:
+        return match_ratio, WEIGHTS["ocr_bonus_fair"]  # 보통
+    elif match_ratio >= WEIGHTS["ocr_threshold_minimum"]:
+        return match_ratio, WEIGHTS["ocr_bonus_poor"]  # 미흡
+    else:
+        return match_ratio, 0.0  # 최소치 미만: 보너스 없음
 
 # ==========================================
 # 3. 메인 API: 이미지 검색 (+ 필터)
@@ -91,13 +350,13 @@ async def search_by_image(
     try:
         # 1. 이미지 읽기
         image_data = await file.read()
-        image = Image.open(io.BytesIO(image_data))
+        image = Image.open(io.BytesIO(image_data)).convert("RGB")
 
         # 2. [정밀 모드] 업로드된 이미지 OCR 수행 (속도 희생, 정확도 UP)
-        ocr_result = ocr.ocr(np.array(image), cls=True)
+        ocr_result = ocr.predict(input=np.array(image))
         detected_texts = []
-        if ocr_result and ocr_result[0]:
-            detected_texts = [line[1][0] for line in ocr_result[0]]
+        for res in ocr_result:
+            detected_texts.extend(_extract_texts(res))
         full_ocr_text = " ".join(detected_texts)
         
         print(f"📸 OCR 감지된 텍스트: {full_ocr_text}")
@@ -108,31 +367,88 @@ async def search_by_image(
         # 4. 1차 후보군 검색 (벡터로 상위 50개 가져옴 - 넉넉하게)
         results = collection.query(
             query_embeddings=[query_vector],
-            n_results=50, 
-            include=["metadatas", "distances", "ids"]
+            n_results=50,
+            include=["metadatas", "distances", "embeddings"]
+        )
+
+        print(
+            "DEBUG query results:",
+            {
+                "ids": len(results.get("ids", [])),
+                "metadatas": len(results.get("metadatas", [])),
+                "distances": len(results.get("distances", [])),
+            },
         )
 
         # 5. 2차 재순위화 (Re-ranking)
         candidates = []
         user_inputs = {"name": name, "price": price, "brand": brand, "keyword": keyword}
         
-        ids = results['ids'][0]
-        metadatas = results['metadatas'][0]
-        distances = results['distances'][0]
+        ids_list = results.get('ids', [])
+        metas_list = results.get('metadatas', [])
+        dists_list = results.get('distances', [])
+        embeddings_list = results.get('embeddings', [])
 
-        for i in range(len(ids)):
-            item = metadatas[i]
-            item['id'] = ids[i]
-            item['similarity_score'] = 1 - distances[i] # 기본 벡터 점수
+        if not ids_list or not ids_list[0]:
+            return {
+                "status": "success",
+                "detected_text": full_ocr_text,
+                "results": []
+            }
+
+        ids = ids_list[0]
+        metadatas = metas_list[0] if metas_list else []
+        distances = dists_list[0] if dists_list else []
+        embeddings = embeddings_list[0] if embeddings_list else []
+
+        print(
+            "DEBUG first batch sizes:",
+            {
+                "ids": len(ids),
+                "metadatas": len(metadatas),
+                "distances": len(distances),
+                "embeddings": len(embeddings),
+            },
+        )
+
+        debug_scored = 0
+        for item_id, meta, dist, embedding in zip(ids, metadatas, distances, embeddings):
+            item = meta
+            item['id'] = item_id
+            # Cosine similarity (0~1 범위)
+            cosine_dist = cosine(query_vector, embedding)
+            item['similarity_score'] = 1 - cosine_dist
             
-            # 여기서 가중치 계산!
-            final_score = calculate_final_score(item, user_inputs)
-            
-            # (옵션) 업로드된 이미지의 OCR 텍스트와 DB 데이터 매칭 보너스
-            # 예: 사진에 'BIG'이라 써있고, DB 상품명에도 'BIG'이 있으면 추가 점수
-            for text in detected_texts:
-                if len(text) > 2 and text in (item.get('name', '') + item.get('ocr_text', '')):
-                     final_score += 0.05
+            # 여기서 가중치 계산! (detected_texts 포함)
+            if DEBUG_SCORING:
+                final_score, reasons, breakdown = calculate_score_with_debug(item, user_inputs, detected_texts)
+            else:
+                final_score = calculate_final_score(item, user_inputs, detected_texts)
+                reasons = []
+                breakdown = {}
+
+            if DEBUG_SCORING and debug_scored < DEBUG_SCORING_LIMIT:
+                print("=" * 80)
+                print(f"🔍 DEBUG [{debug_scored + 1}/{DEBUG_SCORING_LIMIT}] - {item.get('name', 'Unknown')}")
+                print(f"📦 ID: {item_id}")
+                print(f"🏢 Maker: {item.get('maker', 'N/A')}")
+                print(f"💰 Price: {item.get('price', 'N/A')}")
+                print("-" * 80)
+                print(f"📊 Base Score (벡터 유사도): {item['similarity_score']:.4f}")
+                print(f"🎁 Bonus Breakdown:")
+                print(f"   • Brand:   +{breakdown.get('brand', 0.0):.3f}")
+                print(f"   • Price:   +{breakdown.get('price', 0.0):.3f}")
+                print(f"   • Name:    +{breakdown.get('name', 0.0):.3f}")
+                print(f"   • Keyword: +{breakdown.get('keyword', 0.0):.3f}")
+                print(f"   • OCR:     +{breakdown.get('ocr', 0.0):.3f} (일치율: {breakdown.get('ocr_ratio', 0.0):.1f}%)")
+                print(f"   💡 Total Bonus: {sum([breakdown.get('brand', 0), breakdown.get('price', 0), breakdown.get('name', 0), breakdown.get('keyword', 0), breakdown.get('ocr', 0)]):.3f}")
+                print("-" * 80)
+                print(f"⭐ Final Score (정규화): {final_score:.4f}")
+                if reasons:
+                    print(f"📝 Reasons: {' | '.join(reasons)}")
+                print("=" * 80)
+                print()
+                debug_scored += 1
 
             item['final_score'] = final_score
             candidates.append(item)
@@ -141,12 +457,22 @@ async def search_by_image(
         candidates.sort(key=lambda x: x['final_score'], reverse=True)
         top_20 = candidates[:20]
 
-        return {
+        response_payload = {
             "status": "success",
             "detected_text": full_ocr_text, # 디버깅용: OCR이 뭘 읽었는지 알려줌
             "results": top_20
         }
 
+        with open(RESPONSE_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(response_payload, f, ensure_ascii=False, indent=2)
+
+        return response_payload
+
     except Exception as e:
-        print(f"❌ 에러: {e}")
+        print("❌ 에러 발생:")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
