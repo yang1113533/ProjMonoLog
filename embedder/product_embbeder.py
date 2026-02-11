@@ -14,7 +14,7 @@ import chromadb
 # ==========================================
 # 1. 설정 (Configuration)
 # ==========================================
-JSON_FILE = "../crawl/20260210_144639_products.json"  # 최신 데이터 파일 경로
+JSON_FILE = "../crawl/example.json"  # 최신 데이터 파일 경로
 IMAGE_DIR = "../crawl/images"
 DB_PATH = "./chroma_db"
 COLLECTION_NAME = "rakuten_products"
